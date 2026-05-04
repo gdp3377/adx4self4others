@@ -799,15 +799,20 @@ class App(tk.Tk):
         return where, args
 
     def _get_dur_filter(self) -> str:
-        """从时长勾选生成 SQL 片段（OR 组合）。"""
+        """从时长勾选生成 SQL 片段（OR 组合）。
+        duration=0 或 NULL 表示无时长数据，始终保留不过滤。"""
         _DR = {
-            "0-5": "(COALESCE(duration,0) > 0 AND duration < 300000)",
+            "0-5": "(duration > 0 AND duration < 300000)",
             "5-10": "(duration >= 300000 AND duration < 600000)",
             "10-15": "(duration >= 600000 AND duration < 900000)",
             "15+": "(duration >= 900000)",
         }
         parts = [_DR[k] for k, v in self._dur_vars.items() if v.get() and k in _DR]
-        return f"({' OR '.join(parts)})" if parts else ""
+        if not parts:
+            return ""
+        # 无时长数据的素材始终包含
+        parts.append("COALESCE(duration,0) = 0")
+        return f"({' OR '.join(parts)})"
 
     def _build_search_query(self) -> tuple[str, list[dict]]:
         """搜索预览：按剧名分组，返回素材数和评分。"""
