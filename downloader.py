@@ -87,7 +87,8 @@ def _turso_val(v) -> dict:
     return {"type": "text", "value": str(v)}
 
 
-def turso_query(base_url: str, token: str, sql: str, args: list[dict] | None = None) -> list[dict]:
+def turso_query(base_url: str, token: str, sql: str, args: list[dict] | None = None,
+                _timeout: int = 30, _retries: int = 2) -> list[dict]:
     url = base_url.replace("libsql://", "https://") + "/v2/pipeline"
     stmt = {"sql": sql}
     if args:
@@ -96,12 +97,22 @@ def turso_query(base_url: str, token: str, sql: str, args: list[dict] | None = N
         {"type": "execute", "stmt": stmt},
         {"type": "close"},
     ]}).encode()
-    req = request.Request(url, data=body, method="POST", headers={
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    })
-    with _urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read())
+    last_err = None
+    for attempt in range(_retries + 1):
+        try:
+            req = request.Request(url, data=body, method="POST", headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            })
+            with _urlopen(req, timeout=_timeout) as resp:
+                data = json.loads(resp.read())
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < _retries:
+                import time; time.sleep(2)
+    else:
+        raise last_err  # type: ignore[misc]
     results = data.get("results", [])
     if not results:
         return []
