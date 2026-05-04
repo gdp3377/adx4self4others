@@ -812,9 +812,6 @@ class App(tk.Tk):
     def _build_search_query(self) -> tuple[str, list[dict]]:
         """搜索预览：按剧名分组，返回素材数和评分。"""
         where, args = self._get_common_where()
-        dur = self._get_dur_filter()
-        if dur:
-            where.append(dur)
         score_val = self.cmb_score.get()
         min_score = int(score_val) if score_val.isdigit() else 0
         having = f"HAVING jx_count >= {min_score} " if min_score > 0 else ""
