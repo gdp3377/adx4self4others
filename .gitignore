@@ -1,0 +1,6 @@
+config.json
+db_snapshot.json
+.venv/
+__pycache__/
+github_token.txt
+*.pyc
