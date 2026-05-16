@@ -39,6 +39,23 @@ foreach ($f in $files) {
     }
 }
 
+# ── Update LocalDashboard/sync.py ──
+Write-Host "`nUpdating LocalDashboard..." -ForegroundColor Cyan
+$ldDir = Join-Path $PSScriptRoot "LocalDashboard"
+if (-not (Test-Path $ldDir)) {
+    New-Item -ItemType Directory -Path $ldDir -Force | Out-Null
+}
+try {
+    $syncUrl = "$baseRaw/LocalDashboard/sync.py"
+    $syncDest = Join-Path $ldDir "sync.py"
+    Invoke-WebRequest -Uri $syncUrl -OutFile $syncDest -UseBasicParsing -ErrorAction Stop
+    Write-Host "  LocalDashboard/sync.py OK" -ForegroundColor Green
+    $ok++
+} catch {
+    Write-Host "  LocalDashboard/sync.py FAIL: $_" -ForegroundColor Red
+    $fail++
+}
+
 Write-Host ""
 Write-Host "=========================================" -ForegroundColor Cyan
 Write-Host "  Update complete: $ok success, $fail failed" -ForegroundColor Cyan

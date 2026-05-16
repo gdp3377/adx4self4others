@@ -5,10 +5,21 @@ AdXray 数据库变更通知工具（独立版）
 """
 import json
 import ssl
+import sys
 import time
 from datetime import datetime, date
 from pathlib import Path
 from urllib import request
+
+# 导入本地同步模块（支持多种目录结构）
+_HERE = Path(__file__).parent
+for _candidate in [_HERE / "LocalDashboard", _HERE.parent / "LocalDashboard"]:
+    if (_candidate / "sync.py").exists():
+        sys.path.insert(0, str(_candidate))
+        break
+else:
+    sys.path.insert(0, str(_HERE.parent / "LocalDashboard"))
+from sync import get_db, sync
 
 # ─── SSL 兜底 ────────────────────────────────────
 _SSL_CTX = ssl.create_default_context()
@@ -47,49 +58,16 @@ def save_snapshot(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ─── Turso 查询 ──────────────────────────────────
+# ─── 本地 SQLite 查询 ────────────────────────
 
-def _turso_val(v):
-    if v is None:
-        return {"type": "null"}
-    if isinstance(v, int):
-        return {"type": "integer", "value": str(v)}
-    return {"type": "text", "value": str(v)}
-
-
-def turso_query(base_url: str, token: str, sql: str, args=None,
-                retries: int = 3) -> list[dict]:
-    url = base_url.replace("libsql://", "https://") + "/v2/pipeline"
-    stmt = {"sql": sql}
-    if args:
-        stmt["args"] = args
-    body = json.dumps({"requests": [
-        {"type": "execute", "stmt": stmt},
-        {"type": "close"},
-    ]}).encode()
-    for attempt in range(retries):
-        try:
-            req = request.Request(url, data=body, method="POST", headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            })
-            with _urlopen(req) as resp:
-                data = json.loads(resp.read())
-            results = data.get("results", [])
-            if not results:
-                return []
-            r0 = results[0].get("response", {}).get("result", {})
-            cols = [c["name"] for c in r0.get("cols", [])]
-            rows = []
-            for row in r0.get("rows", []):
-                rows.append({cols[i]: (cell.get("value") if cell.get("type") != "null" else None)
-                             for i, cell in enumerate(row)})
-            return rows
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(3)
-            else:
-                raise
+def local_query(sql, params=None):
+    """查询本地 SQLite 缓存，返回 list[dict]。"""
+    conn = get_db()
+    cur = conn.execute(sql, params or [])
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    conn.close()
+    return rows
 
 
 # ─── 飞书发送 ────────────────────────────────────
@@ -120,10 +98,10 @@ LANG_SHORT = {
 
 # ─── 核心逻辑 ────────────────────────────────────
 
-def query_current_stats(base_url: str, token: str) -> dict:
-    """查询数据库当前快照：总量 + 各剧场语种分布 + 备注分布。"""
+def query_current_stats() -> dict:
+    """查询本地数据库当前快照：总量 + 各剧场语种分布 + 备注分布。"""
     # 1. 各剧场×语种 总量
-    rows = turso_query(base_url, token,
+    rows = local_query(
         "SELECT theater, language, COUNT(*) as cnt "
         "FROM materials GROUP BY theater, language ORDER BY theater, language")
     by_theater_lang = {}
@@ -132,7 +110,7 @@ def query_current_stats(base_url: str, token: str) -> dict:
         by_theater_lang[key] = int(r["cnt"])
 
     # 2. 各剧场×语种×备注
-    rows = turso_query(base_url, token,
+    rows = local_query(
         "SELECT theater, language, COALESCE(remark,'待备注') as remark, COUNT(*) as cnt "
         "FROM materials GROUP BY theater, language, remark ORDER BY theater, language, remark")
     by_theater_lang_remark = {}
@@ -141,16 +119,16 @@ def query_current_stats(base_url: str, token: str) -> dict:
         by_theater_lang_remark[key] = int(r["cnt"])
 
     # 3. 总量
-    rows = turso_query(base_url, token, "SELECT COUNT(*) as cnt FROM materials")
+    rows = local_query("SELECT COUNT(*) as cnt FROM materials")
     total = int(rows[0]["cnt"]) if rows else 0
 
     # 4. 今日新增（synced_at >= 今天 00:00）
     today_start = int(datetime.combine(date.today(), datetime.min.time()).timestamp())
-    rows = turso_query(base_url, token,
+    rows = local_query(
         "SELECT theater, language, COUNT(*) as cnt "
         "FROM materials WHERE synced_at >= ? "
         "GROUP BY theater, language ORDER BY theater, language",
-        [_turso_val(today_start)])
+        [today_start])
     today_new = {}
     for r in rows:
         key = f"{r['theater']}|{r['language']}"
@@ -270,20 +248,15 @@ def build_report(current: dict, previous: dict) -> str:
 
 def run_once(cfg: dict):
     """执行一次查询 + 对比 + 发送。"""
-    base_url = cfg.get("turso_url", "")
-    token = cfg.get("turso_token", "")
     webhook = cfg.get("feishu_webhook", "")
 
-    if not base_url or not token:
-        print("[ERROR] config.json 中 turso_url 或 turso_token 为空")
-        return
     if not webhook:
         print("[ERROR] config.json 中 feishu_webhook 为空")
         return
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 查询数据库...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 查询本地数据库...")
     try:
-        current = query_current_stats(base_url, token)
+        current = query_current_stats()
     except Exception as e:
         print(f"[ERROR] 查询失败: {e}")
         try:
@@ -306,7 +279,7 @@ def run_once(cfg: dict):
     save_snapshot(current)
 
 
-def should_trigger(last_run_date: str, last_times: list[str]) -> str | None:
+def should_trigger(last_run_date, last_times):
     """检查当前时刻是否应触发某个时间点。返回触发的时间点或 None。"""
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")

@@ -1,7 +1,7 @@
 """
 AdXray 云端素材下载器（轻量独立版）
-直连 Turso 云数据库查询 + 批量下载视频，无需额外依赖。
-使用前请编辑 config.json 填入 turso_url 和 turso_token。
+直连 D1 云数据库写入 + 批量下载视频，无需额外依赖。
+使用前请确保目录下有 d1_config.json。
 """
 import calendar
 import csv
@@ -9,12 +9,33 @@ import io
 import json
 import re
 import ssl
+import sys
+import time
 import tkinter as tk
 from datetime import date, datetime, timedelta
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Event
 from urllib import request
+
+_DL_LOG = Path(__file__).parent / "download_debug.log"
+
+
+def _dl_log(msg: str):
+    """写入下载日志并立即刷盘。"""
+    with open(_DL_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        f.flush()
+
+# 导入本地同步模块（支持多种目录结构）
+_HERE = Path(__file__).parent
+for _candidate in [_HERE / "LocalDashboard", _HERE.parent / "LocalDashboard"]:
+    if (_candidate / "sync.py").exists():
+        sys.path.insert(0, str(_candidate))
+        break
+else:
+    sys.path.insert(0, str(_HERE.parent / "LocalDashboard"))
+from sync import get_db, sync, DB_PATH
 
 # SSL 兜底：部分 Windows 机器缺少根证书，直接跳过验证
 _SSL_CTX = ssl.create_default_context()
@@ -32,6 +53,11 @@ DEFAULT_CONFIG = {
     "turso_url": "libsql://adxray-xxx.turso.io",
     "turso_token": "",
     "download_root": str(Path.home() / "Downloads" / "adx_videos"),
+    "is_master": True,
+    "r2_account_id": "",
+    "r2_access_key_id": "",
+    "r2_secret_key": "",
+    "r2_bucket": "adxray-cache",
 }
 
 # ─── 我的剧场（已知的 7 个主要剧场关键词，用于快速筛选） ──
@@ -77,88 +103,71 @@ def save_config(cfg: dict):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
-# ─── Turso HTTP API ──────────────────────────────
+# ─── 本地 SQLite 查询 ──────────────────────────────
 
-def _turso_val(v) -> dict:
-    if v is None:
-        return {"type": "null"}
-    if isinstance(v, int):
-        return {"type": "integer", "value": str(v)}
-    return {"type": "text", "value": str(v)}
+def _turso_val(v):
+    """参数值：直接返回原始值供 SQLite 使用。"""
+    return v
 
 
-def turso_query(base_url: str, token: str, sql: str, args: list[dict] | None = None,
-                _timeout: int = 30, _retries: int = 2) -> list[dict]:
-    url = base_url.replace("libsql://", "https://") + "/v2/pipeline"
-    stmt = {"sql": sql}
-    if args:
-        stmt["args"] = args
-    body = json.dumps({"requests": [
-        {"type": "execute", "stmt": stmt},
-        {"type": "close"},
-    ]}).encode()
-    last_err = None
-    for attempt in range(_retries + 1):
-        try:
-            req = request.Request(url, data=body, method="POST", headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            })
-            with _urlopen(req, timeout=_timeout) as resp:
-                data = json.loads(resp.read())
-            break
-        except Exception as e:
-            last_err = e
-            if attempt < _retries:
-                import time; time.sleep(2)
-    else:
-        raise last_err  # type: ignore[misc]
-    results = data.get("results", [])
-    if not results:
-        return []
-    r0 = results[0]
-    if r0.get("type") == "error":
-        err = r0.get("error", {})
-        raise RuntimeError(f"Turso 查询错误: {err.get('message', err)}")
-    result = r0.get("response", {}).get("result", {})
-    cols = [c["name"] for c in result.get("cols", [])]
-    rows = []
-    for row in result.get("rows", []):
-        rows.append({cols[i]: (cell.get("value") if cell.get("type") != "null" else None)
-                     for i, cell in enumerate(row)})
+def local_query(sql, params=None):
+    """查询本地 SQLite 缓存，返回 list[dict]。"""
+    conn = get_db()
+    cur = conn.execute(sql, params or [])
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    conn.close()
     return rows
 
 
-def turso_execute(base_url: str, token: str, sql: str, args: list[dict] | None = None) -> int:
+def local_distinct(column):
+    """从本地 SQLite 获取 DISTINCT 值。"""
+    rows = local_query(f"SELECT DISTINCT {column} FROM materials ORDER BY {column}")
+    return [r[column] for r in rows if r.get(column)]
+
+
+# ─── D1 写入（仅标注 remark 等写操作需要）───────
+
+def _escape_val(v) -> str:
+    """值转 SQL 内联安全字符串。"""
+    if v is None:
+        return "NULL"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def _load_d1_config():
+    """加载 D1 配置。"""
+    for p in [Path(__file__).parent / "d1_config.json",
+              Path(__file__).parent.parent / "d1_config.json"]:
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    return None
+
+
+def d1_execute(sql):
     """执行非查询语句（UPDATE/INSERT），返回受影响行数。"""
-    url = base_url.replace("libsql://", "https://") + "/v2/pipeline"
-    stmt = {"sql": sql}
-    if args:
-        stmt["args"] = args
-    body = json.dumps({"requests": [
-        {"type": "execute", "stmt": stmt},
-        {"type": "close"},
-    ]}).encode()
+    cfg = _load_d1_config()
+    if not cfg:
+        raise RuntimeError("找不到 d1_config.json")
+    url = (f"https://api.cloudflare.com/client/v4/accounts/"
+           f"{cfg['account_id']}/d1/database/{cfg['database_id']}/query")
+    body = json.dumps({"sql": sql}).encode()
     req = request.Request(url, data=body, method="POST", headers={
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {cfg['api_token']}",
         "Content-Type": "application/json",
     })
     with _urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read())
-    results = data.get("results", [])
-    if not results:
-        return 0
-    r0 = results[0]
-    if r0.get("type") == "error":
-        err = r0.get("error", {})
-        raise RuntimeError(f"Turso 执行错误: {err.get('message', err)}")
-    return r0.get("response", {}).get("result", {}).get("affected_row_count", 0)
-
-
-def turso_distinct(base_url: str, token: str, column: str) -> list[str]:
-    rows = turso_query(base_url, token,
-                       f"SELECT DISTINCT {column} FROM materials ORDER BY {column}")
-    return [r[column] for r in rows if r.get(column)]
+    if not data.get("success"):
+        errs = data.get("errors", [])
+        msg = errs[0].get("message", "?") if errs else "unknown"
+        raise RuntimeError(f"D1 执行错误: {msg}")
+    total = 0
+    for r in data.get("result", []):
+        total += r.get("meta", {}).get("changes", 0)
+    return total
 
 
 # ─── 语种映射 ────────────────────────────────────
@@ -204,19 +213,40 @@ def _sort_languages(langs: list[str]) -> list[str]:
 HASH_RE = re.compile(r"[a-f0-9]{32}", re.IGNORECASE)
 
 
-def download_file(url: str, dest: Path) -> bool:
+def download_file(url: str, dest: Path, cancel_event: Event = None,
+                  file_timeout: int = 120) -> bool:
+    """下载单个文件。支持 cancel_event 中断和整体超时。"""
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    _dl_log(f"START {dest.name} <- {url[:120]}")
     try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
         req = request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with _urlopen(req, timeout=30) as resp:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "wb") as f:
+        deadline = time.time() + file_timeout
+        t0 = time.time()
+        with _urlopen(req, timeout=15) as resp:
+            _dl_log(f"  CONNECTED {dest.name} ({time.time()-t0:.1f}s)")
+            size = 0
+            with open(tmp, "wb") as f:
                 while True:
+                    if cancel_event and cancel_event.is_set():
+                        _dl_log(f"  CANCELLED {dest.name}")
+                        tmp.unlink(missing_ok=True)
+                        return False
+                    if time.time() > deadline:
+                        _dl_log(f"  TIMEOUT {dest.name} ({size} bytes so far)")
+                        tmp.unlink(missing_ok=True)
+                        return False
                     chunk = resp.read(65536)
                     if not chunk:
                         break
+                    size += len(chunk)
                     f.write(chunk)
+        tmp.rename(dest)
+        _dl_log(f"  OK {dest.name} ({size} bytes, {time.time()-t0:.1f}s)")
         return True
-    except Exception:
+    except Exception as e:
+        _dl_log(f"  FAIL {dest.name}: {e}")
+        tmp.unlink(missing_ok=True)
         return False
 
 
@@ -372,15 +402,15 @@ class App(tk.Tk):
         self.resizable(True, True)
         self.cfg = load_config()
         self._downloading = False
-        self._turso_url = self.cfg["turso_url"]
-        self._turso_token = self.cfg["turso_token"]
+        self._cancel_event = Event()
         self._lang_display_to_db: dict[str, str] = {}
 
-        if not self._turso_token:
+        if not _load_d1_config() and self.cfg.get("is_master", True):
             messagebox.showwarning(
                 "配置缺失",
-                "请先编辑 config.json 填入 turso_url 和 turso_token，\n"
-                f"配置文件位置：{CONFIG_FILE}",
+                "主机模式需要 d1_config.json，\n"
+                "客户端模式请设置 is_master=false\n"
+                f"配置目录：{Path(__file__).parent}",
             )
 
         self._build_ui()
@@ -423,56 +453,71 @@ class App(tk.Tk):
         self.cmb_view_status.set("全部")
         self.cmb_view_status.grid(row=1, column=7, sticky="w", padx=4)
 
-        # 行 2：投放日期
-        ttk.Label(frm_filter, text="投放起始:").grid(row=2, column=0, sticky="e")
+        # 行 2a：排除项（多选 checkbutton）
+        ttk.Label(frm_filter, text="排除项:").grid(row=2, column=0, sticky="e")
+        self._excl_违规 = tk.BooleanVar(value=True)
+        self._excl_已删除 = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm_filter, text="违规", variable=self._excl_违规).grid(
+            row=2, column=1, sticky="w", padx=4)
+        ttk.Checkbutton(frm_filter, text="已删除", variable=self._excl_已删除).grid(
+            row=2, column=2, sticky="w", padx=4)
+
+        # 行 2b：音频语种
+        ttk.Label(frm_filter, text="音频语种:").grid(row=2, column=4, sticky="e")
+        self.cmb_audio_lang = ttk.Combobox(frm_filter, state="readonly", width=14)
+        self.cmb_audio_lang.grid(row=2, column=5, sticky="w", padx=4)
+
+        # 行 3：投放日期
+        ttk.Label(frm_filter, text="投放起始:").grid(row=3, column=0, sticky="e")
         frm_df = ttk.Frame(frm_filter)
-        frm_df.grid(row=2, column=1, sticky="w", padx=4, pady=4)
+        frm_df.grid(row=3, column=1, sticky="w", padx=4, pady=4)
         self.ent_date_from = ttk.Entry(frm_df, width=12)
         self.ent_date_from.pack(side="left")
         ttk.Button(frm_df, text="\U0001f4c5", width=3,
                    command=lambda: CalendarPopup(self, self.ent_date_from)).pack(side="left", padx=2)
 
-        ttk.Label(frm_filter, text="投放结束:").grid(row=2, column=2, sticky="e")
+        ttk.Label(frm_filter, text="投放结束:").grid(row=3, column=2, sticky="e")
         frm_dt = ttk.Frame(frm_filter)
-        frm_dt.grid(row=2, column=3, sticky="w", padx=4, pady=4)
+        frm_dt.grid(row=3, column=3, sticky="w", padx=4, pady=4)
+
         self.ent_date_to = ttk.Entry(frm_dt, width=12)
         self.ent_date_to.pack(side="left")
         ttk.Button(frm_dt, text="\U0001f4c5", width=3,
                    command=lambda: CalendarPopup(self, self.ent_date_to)).pack(side="left", padx=2)
 
         # 行 3：抓取日期
-        ttk.Label(frm_filter, text="抓取起始:").grid(row=3, column=0, sticky="e")
+        ttk.Label(frm_filter, text="抓取起始:").grid(row=4, column=0, sticky="e")
         frm_sf = ttk.Frame(frm_filter)
-        frm_sf.grid(row=3, column=1, sticky="w", padx=4, pady=4)
+        frm_sf.grid(row=4, column=1, sticky="w", padx=4, pady=4)
         self.ent_synced_from = ttk.Entry(frm_sf, width=12)
         self.ent_synced_from.pack(side="left")
         ttk.Button(frm_sf, text="\U0001f4c5", width=3,
                    command=lambda: CalendarPopup(self, self.ent_synced_from)).pack(side="left", padx=2)
 
-        ttk.Label(frm_filter, text="抓取结束:").grid(row=3, column=2, sticky="e")
+        ttk.Label(frm_filter, text="抓取结束:").grid(row=4, column=2, sticky="e")
         frm_st = ttk.Frame(frm_filter)
-        frm_st.grid(row=3, column=3, sticky="w", padx=4, pady=4)
+        frm_st.grid(row=4, column=3, sticky="w", padx=4, pady=4)
         self.ent_synced_to = ttk.Entry(frm_st, width=12)
         self.ent_synced_to.pack(side="left")
         ttk.Button(frm_st, text="\U0001f4c5", width=3,
                    command=lambda: CalendarPopup(self, self.ent_synced_to)).pack(side="left", padx=2)
 
-        # 行 4：评分 / 剧名搜索
-        ttk.Label(frm_filter, text="最低评分:").grid(row=4, column=0, sticky="e")
+        # 行 5：评分 / 剧名搜索
+        ttk.Label(frm_filter, text="最低评分:").grid(row=5, column=0, sticky="e")
         self.cmb_score = ttk.Combobox(frm_filter, state="readonly", width=8,
                                        values=["不限", "1", "2", "3", "5", "8", "10"])
         self.cmb_score.set("不限")
-        self.cmb_score.grid(row=4, column=1, sticky="w", padx=4, pady=4)
+        self.cmb_score.grid(row=5, column=1, sticky="w", padx=4, pady=4)
 
-        ttk.Label(frm_filter, text="最少素材:").grid(row=4, column=2, sticky="e")
+        ttk.Label(frm_filter, text="最少素材:").grid(row=5, column=2, sticky="e")
         self.cmb_min_mat = ttk.Combobox(frm_filter, state="readonly", width=8,
                                          values=["不限", "2", "3", "5", "10", "20", "50"])
         self.cmb_min_mat.set("不限")
-        self.cmb_min_mat.grid(row=4, column=3, sticky="w", padx=4, pady=4)
+        self.cmb_min_mat.grid(row=5, column=3, sticky="w", padx=4, pady=4)
 
-        ttk.Label(frm_filter, text="剧名搜索:").grid(row=4, column=4, sticky="e")
+        ttk.Label(frm_filter, text="剧名搜索:").grid(row=5, column=4, sticky="e")
         self.ent_keyword = ttk.Entry(frm_filter, width=30)
-        self.ent_keyword.grid(row=4, column=5, columnspan=3, sticky="ew", padx=4, pady=4)
+        self.ent_keyword.grid(row=5, column=5, columnspan=3, sticky="ew", padx=4, pady=4)
 
         frm_filter.columnconfigure(1, weight=1)
 
@@ -523,6 +568,9 @@ class App(tk.Tk):
         self.btn_download = ttk.Button(frm_btn, text="下载选中", command=self._start_download)
         self.btn_download.pack(side="left", padx=6)
 
+        self.btn_cancel = ttk.Button(frm_btn, text="取消下载", command=self._cancel_download, state="disabled")
+        self.btn_cancel.pack(side="left", padx=6)
+
         self.btn_export = ttk.Button(frm_btn, text="导出 CSV", command=self._export_csv)
         self.btn_export.pack(side="left", padx=6)
 
@@ -563,10 +611,11 @@ class App(tk.Tk):
         frm_mark.columnconfigure(3, weight=1)
 
         # ── 结果列表（带勾选） ──
-        cols = ("sel", "theater", "language", "drama_name", "cnt", "score")
+        cols = ("sel", "theater", "language", "audio_lang", "drama_name", "cnt", "score")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12)
         for c, w, t in [
             ("sel", 30, "✓"), ("theater", 120, "剧场"), ("language", 60, "语种"),
+            ("audio_lang", 70, "音频语种"),
             ("drama_name", 200, "剧名"), ("cnt", 50, "素材数"), ("score", 50, "评分"),
         ]:
             self.tree.heading(c, text=t)
@@ -602,21 +651,20 @@ class App(tk.Tk):
             return
         lbl_widget.config(text=f"正在处理 {len(hashes)} 条…")
         self.update()
-        url, token = self._get_turso()
         matched = 0
         not_found = 0
         try:
             for h in hashes:
-                rows = turso_query(url, token,
+                rows = local_query(
                     "SELECT COUNT(*) as cnt FROM materials WHERE video_url LIKE ?",
-                    [_turso_val(f"%{h}%")])
+                    [f"%{h}%"])
                 cnt = int(rows[0]["cnt"]) if rows else 0
                 if cnt == 0:
                     not_found += 1
                     continue
-                turso_execute(url, token,
-                    "UPDATE materials SET remark = ? WHERE video_url LIKE ?",
-                    [_turso_val(remark), _turso_val(f"%{h}%")])
+                d1_execute(
+                    f"UPDATE materials SET remark = {_escape_val(remark)} "
+                    f"WHERE video_hash = {_escape_val(h)}")
                 matched += cnt
         except Exception as e:
             lbl_widget.config(text=f"失败: {e}")
@@ -642,16 +690,10 @@ class App(tk.Tk):
     def _on_dur_item(self):
         self._dur_all.set(all(v.get() for v in self._dur_vars.values()))
 
-    def _get_turso(self):
-        return self._turso_url, self._turso_token
-
     def _load_filters(self):
-        url, token = self._get_turso()
-        if not url or not token:
-            self.lbl_status.config(text="config.json 中 turso_token 为空")
-            return
+        # 客户端模式不需要 D1 配置，直接读本地 SQLite
         try:
-            theaters = turso_distinct(url, token, "theater")
+            theaters = local_distinct("theater")
             # 去除 HTML 标签残留
             theaters = [re.sub(r"<[^>]+>", "", t).strip() for t in theaters]
             theaters = sorted(set(t for t in theaters if t))
@@ -698,7 +740,7 @@ class App(tk.Tk):
             if merged_other:
                 theater_values += ["── 其他剧场 ──"] + merged_other
             self._my_theaters = set(merged_my)
-            raw_langs = turso_distinct(url, token, "language")
+            raw_langs = local_distinct("language")
             # 语种：代码 → 中文，排序，保留双向映射
             display_langs = [_lang_display(l) for l in raw_langs]
             self._lang_display_to_db = {_lang_display(l): l for l in raw_langs}
@@ -707,17 +749,80 @@ class App(tk.Tk):
             self.cmb_theater.set("全部剧场")
             self.cmb_lang["values"] = ["全部语种"] + display_langs
             self.cmb_lang.set("全部语种")
+            # 音频语种（audio_language 列，可能含 "中文+英文" 格式）
+            self._audio_lang_zh = _AUDIO_LANG_ZH = {
+                "en": "英语", "de": "德语", "fr": "法语", "ja": "日语",
+                "ko": "韩语", "es": "西班牙语", "pt": "葡萄牙语",
+                "th": "泰语", "vi": "越南语", "ms": "马来语",
+                "zh": "中文", "ru": "俄语", "ar": "阿拉伯语",
+                "hi": "印地语", "id": "印尼语", "tr": "土耳其语",
+                "it": "意大利语", "pl": "波兰语", "nl": "荷兰语",
+                "sv": "瑞典语", "da": "丹麦语", "fi": "芬兰语",
+                "no": "挪威语", "uk": "乌克兰语", "cs": "捷克语",
+                "ro": "罗马尼亚语", "hu": "匈牙利语", "el": "希腊语",
+                "he": "希伯来语", "bn": "孟加拉语", "ta": "泰米尔语",
+                "tl": "菲律宾语", "sw": "斯瓦希里语", "my": "缅甸语",
+                "km": "高棉语", "lo": "老挝语", "mn": "蒙古语",
+                "ne": "尼泊尔语", "si": "僧伽罗语", "am": "阿姆哈拉语",
+                "jw": "爪哇语", "cy": "威尔士语", "haw": "夏威夷语",
+                "nn": "新挪威语", "af": "南非荷兰语", "sq": "阿尔巴尼亚语",
+                "bg": "保加利亚语", "hr": "克罗地亚语", "sk": "斯洛伐克语",
+                "sl": "斯洛文尼亚语", "sr": "塞尔维亚语", "lt": "立陶宛语",
+                "lv": "拉脱维亚语", "et": "爱沙尼亚语", "ka": "格鲁吉亚语",
+                "ur": "乌尔都语", "fa": "波斯语", "ml": "马拉雅拉姆语",
+                "te": "泰卢固语", "kn": "卡纳达语", "gu": "古吉拉特语",
+                "mr": "马拉地语", "pa": "旁遮普语",
+                # 中文变体（DB 可能存 "英文" 而非 "en"）
+                "英文": "英语", "德文": "德语", "法文": "法语", "日文": "日语",
+                "韩文": "韩语", "西班牙文": "西班牙语", "葡萄牙文": "葡萄牙语",
+                "泰文": "泰语", "越南文": "越南语", "马来文": "马来语",
+                "俄文": "俄语", "阿拉伯文": "阿拉伯语",
+            }
+            _AUDIO_PRIORITY = [
+                "英语", "德语", "法语", "日语", "韩语",
+                "西班牙语", "葡萄牙语", "泰语", "越南语", "马来语",
+            ]
+            try:
+                raw_audio = local_query(
+                    "SELECT DISTINCT audio_language FROM materials "
+                    "WHERE audio_language IS NOT NULL AND audio_language != '' "
+                    "ORDER BY audio_language")
+                # 拆解组合值，提取所有唯一单语种
+                audio_set = set()
+                for r in raw_audio:
+                    val = r.get("audio_language", "")
+                    for part in val.split("+"):
+                        p = part.strip()
+                        if p:
+                            audio_set.add(p)
+                # DB值 → 中文显示名，保留双向映射
+                self._audio_display_to_db = {}  # 显示名 → DB值
+                display_set = set()
+                for db_val in audio_set:
+                    zh = _AUDIO_LANG_ZH.get(db_val, db_val)  # 无映射则原样显示
+                    self._audio_display_to_db[zh] = db_val
+                    display_set.add(zh)
+                # 按优先顺序排列
+                priority_order = {name: i for i, name in enumerate(_AUDIO_PRIORITY)}
+                audio_list = sorted(display_set,
+                    key=lambda x: (priority_order.get(x, len(_AUDIO_PRIORITY)), x))
+                self.cmb_audio_lang["values"] = ["全部", "未识别"] + audio_list
+                self.cmb_audio_lang.set("全部")
+            except Exception:
+                self._audio_display_to_db = {}
+                self.cmb_audio_lang["values"] = ["全部", "未识别"]
+                self.cmb_audio_lang.set("全部")
             self.lbl_status.config(
                 text=f"已连接 | {len(merged_my)} 我的剧场, "
                      f"{len(merged_other)} 其他剧场, {len(display_langs)} 语种"
             )
         except Exception as e:
-            self.lbl_status.config(text=f"连接失败: {e}")
+            self.lbl_status.config(text=f"加载失败: {e}")
             messagebox.showerror(
-                "连接失败",
-                f"无法连接 Turso 数据库，请检查：\n\n"
-                f"1. 网络是否正常\n"
-                f"2. config.json 中 turso_url 和 turso_token 是否正确\n\n"
+                "加载失败",
+                f"无法加载本地数据，请检查：\n\n"
+                f"1. 网络是否正常（首次运行需下载缓存）\n"
+                f"2. config.json 中 R2 配置是否正确\n\n"
                 f"错误详情：{e}",
             )
 
@@ -769,6 +874,16 @@ class App(tk.Tk):
             db_lang = getattr(self, "_lang_display_to_db", {}).get(lang, lang)
             where.append("language = ?")
             args.append(_turso_val(db_lang))
+        # 排除项：勾选则排除对应备注的记录
+        excl_vals = []
+        if self._excl_违规.get():
+            excl_vals.append("违规")
+        if self._excl_已删除.get():
+            excl_vals.append("已删除")
+        if excl_vals:
+            placeholders = ",".join(["?"] * len(excl_vals))
+            where.append(f"COALESCE(remark,'待备注') NOT IN ({placeholders})")
+            args.extend(_turso_val(v) for v in excl_vals)
         remark = self.cmb_remark.get()
         if remark and remark != "全部":
             where.append("COALESCE(remark,'待备注') = ?")
@@ -783,6 +898,15 @@ class App(tk.Tk):
         if vs and vs != "全部":
             where.append("COALESCE(view_status,'未看') = ?")
             args.append(_turso_val(vs))
+        audio_lang = self.cmb_audio_lang.get()
+        if audio_lang and audio_lang != "全部":
+            if audio_lang == "未识别":
+                where.append("(audio_language IS NULL OR audio_language = '')")
+            else:
+                # 中文显示名 → DB原值，严格精确匹配
+                db_val = getattr(self, '_audio_display_to_db', {}).get(audio_lang, audio_lang)
+                where.append("audio_language = ?")
+                args.append(_turso_val(db_val))
         df = self.ent_date_from.get().strip()
         if df:
             where.append("first_seen >= ?")
@@ -834,7 +958,8 @@ class App(tk.Tk):
         sql = (
             f"SELECT theater, language, drama_name, COUNT(*) as cnt, "
             f"CAST(SUM(CASE WHEN COALESCE(remark,'待备注')='精选' "
-            f"THEN 1 ELSE 0 END) AS INTEGER) as jx_count "
+            f"THEN 1 ELSE 0 END) AS INTEGER) as jx_count, "
+            f"GROUP_CONCAT(DISTINCT COALESCE(audio_language,'')) as audio_langs "
             f"FROM materials WHERE {' AND '.join(where)} "
             f"GROUP BY theater, language, drama_name "
             f"{having}"
@@ -846,13 +971,14 @@ class App(tk.Tk):
 
     def _query_detail_batch(self, selections: list[dict]) -> list[dict]:
         """分批查询素材明细，避免 SQLite expression tree too large 错误。"""
-        url, token = self._get_turso()
         dur = self._get_dur_filter()
+        # 收集通用筛选条件（包含音频语种、排除项等）
+        common_where, common_args = self._get_common_where()
         all_rows: list[dict] = []
         seen_ids: set[str] = set()
         for i in range(0, len(selections), self._DETAIL_BATCH):
             batch = selections[i:i + self._DETAIL_BATCH]
-            where, args = ["1=1"], []
+            where, args = list(common_where), list(common_args)
             or_parts = []
             for sel in batch:
                 parts = [
@@ -875,7 +1001,7 @@ class App(tk.Tk):
                 f"FROM materials WHERE {' AND '.join(where)} "
                 f"ORDER BY first_seen DESC"
             )
-            rows = turso_query(url, token, sql, args)
+            rows = local_query(sql, args)
             for r in rows:
                 mid = r.get("material_id", "")
                 if mid not in seen_ids:
@@ -898,12 +1024,11 @@ class App(tk.Tk):
         return result
 
     def _search(self):
-        url, token = self._get_turso()
         sql, args = self._build_search_query()
         self.lbl_status.config(text="搜索中...")
         self.update()
         try:
-            rows = turso_query(url, token, sql, args or None)
+            rows = local_query(sql, args or None)
         except Exception as e:
             messagebox.showerror("查询失败", str(e))
             self.lbl_status.config(text="查询失败")
@@ -919,9 +1044,19 @@ class App(tk.Tk):
         for r in rows:
             cnt = int(r.get("cnt", 0))
             checked = cnt >= min_mat
+            # 音频语种：缩写 → 中文
+            _raw_audio = r.get("audio_langs") or ""
+            _audio_parts = []
+            for _p in _raw_audio.split(","):
+                _p = _p.strip()
+                if _p:
+                    _alz = getattr(self, '_audio_lang_zh', {})
+                    _audio_parts.append(_alz.get(_p, _p))
+            _audio_display = ",".join(_audio_parts) if _audio_parts else ""
             iid = self.tree.insert("", "end", values=(
                 "✔" if checked else "",
                 r.get("theater") or "", r.get("language") or "",
+                _audio_display,
                 r.get("drama_name") or "",
                 cnt, r.get("jx_count", 0),
             ))
@@ -994,9 +1129,16 @@ class App(tk.Tk):
         self.cfg["download_root"] = self.ent_path.get().strip()
         save_config(self.cfg)
         self._downloading = True
+        self._cancel_event.clear()
         self.btn_download.config(state="disabled")
+        self.btn_cancel.config(state="normal")
         self._dl_rows = detail_rows
         Thread(target=self._do_download, daemon=True).start()
+
+    def _cancel_download(self):
+        self._cancel_event.set()
+        self.btn_cancel.config(state="disabled")
+        self.lbl_status.config(text="正在取消...")
 
     def _do_download(self):
         root = Path(self.ent_path.get().strip())
@@ -1004,11 +1146,16 @@ class App(tk.Tk):
         rows = self._dl_rows
         total = len(rows)
         success = skip = failed = 0
+        _dl_log(f"=== 开始下载: {total} 条, 目标={root} ===")
 
         for i, row in enumerate(rows):
+            if self._cancel_event.is_set():
+                break
+
             video_url = row.get("video_url") or ""
             if not video_url:
                 skip += 1
+                _dl_log(f"SKIP [{i+1}/{total}] {row.get('drama_name','')} - 无video_url")
                 self.after(0, lambda i=i, s=success, sk=skip, f=failed: self._update_progress(i + 1, total, s, sk, f))
                 continue
 
@@ -1024,26 +1171,33 @@ class App(tk.Tk):
 
             if dest.exists():
                 skip += 1
-            elif download_file(video_url, dest):
+                _dl_log(f"SKIP [{i+1}/{total}] {fname} - 文件已存在: {dest}")
+            elif download_file(video_url, dest, cancel_event=self._cancel_event, file_timeout=120):
                 success += 1
             else:
                 failed += 1
 
             self.after(0, lambda i=i, s=success, sk=skip, f=failed: self._update_progress(i + 1, total, s, sk, f))
 
-        self.after(0, lambda s=success, sk=skip, f=failed: self._download_done(s, sk, f, total))
+        cancelled = self._cancel_event.is_set()
+        self.after(0, lambda s=success, sk=skip, f=failed, c=cancelled: self._download_done(s, sk, f, total, c))
 
     def _update_progress(self, current, total, success, skip, failed=0):
         pct = int(current / total * 100) if total else 0
         self.progress["value"] = pct
         self.lbl_status.config(text=f"下载中 {current}/{total}  成功{success} 跳过{skip} 失败{failed}")
 
-    def _download_done(self, success, skip, failed, total):
+    def _download_done(self, success, skip, failed, total, cancelled=False):
         self._downloading = False
         self.btn_download.config(state="normal")
+        self.btn_cancel.config(state="disabled")
         self.progress["value"] = 100
-        self.lbl_status.config(text=f"完成! 成功{success} 跳过{skip} 失败{failed} 共{total}")
-        messagebox.showinfo("下载完成", f"成功: {success}\n跳过: {skip}\n失败: {failed}\n共: {total}")
+        if cancelled:
+            self.lbl_status.config(text=f"已取消! 成功{success} 跳过{skip} 失败{failed} 共{total}")
+            messagebox.showinfo("已取消", f"成功: {success}\n跳过: {skip}\n失败: {failed}\n共: {total}")
+        else:
+            self.lbl_status.config(text=f"完成! 成功{success} 跳过{skip} 失败{failed} 共{total}")
+            messagebox.showinfo("下载完成", f"成功: {success}\n跳过: {skip}\n失败: {failed}\n共: {total}")
 
 
 if __name__ == "__main__":

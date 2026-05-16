@@ -4,3 +4,8 @@ db_snapshot.json
 __pycache__/
 github_token.txt
 *.pyc
+*.db
+*.db.gz
+*.log
+download_debug.log
+LocalDashboard/cache.*
